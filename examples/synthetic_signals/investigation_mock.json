@@ -1,0 +1,35 @@
+{
+  "kind": "synthetic_sre_investigation_mock",
+  "version": 1,
+  "handoff_sha256": "0fa21d2350ff843e46773a15f73ed98789b6d291d01bfc04386dc92fafbf89c8",
+  "incident_id": "health:synthetic-aws-01/synthetic-aws-prod/synthetic-aws-outage-0001",
+  "status": "complete",
+  "observed": [
+    {
+      "source": "synthetic-aws-01",
+      "scope": "synthetic-aws-prod",
+      "event_id": "synthetic-aws-outage-0001",
+      "evidence": "synthetic-aws-evidence-outage"
+    }
+  ],
+  "hypotheses": [
+    {
+      "text": "A transient routing fault is a candidate cause, not established by this notice.",
+      "supports": [
+        {
+          "source": "synthetic-aws-01",
+          "scope": "synthetic-aws-prod",
+          "event_id": "synthetic-aws-outage-0001",
+          "evidence": "synthetic-aws-evidence-outage"
+        }
+      ],
+      "contradicts": []
+    }
+  ],
+  "unknowns": [
+    "The affected request rate and root cause are unknown."
+  ],
+  "next_checks": [
+    "Is a synthetic reachability observation available for the same target and time?"
+  ]
+}
