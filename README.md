@@ -1,5 +1,7 @@
 # SRE Agent
 
+[English](README.md) · [日本語](README.ja.md)
+
 A multi-cloud incident operations harness for OpenClaw. It is designed to detect cost spikes and service failures across AWS, Azure, Google Cloud, Oracle Cloud Infrastructure, and Sakura Cloud.
 
 **Status:** A local synthetic signal demo is available. Live integrations and remediation are not enabled.
@@ -55,4 +57,4 @@ The command fails rather than treating a missing database or invalid stored evid
 
 Cloud and API authentication are configured separately by the operator. Do not commit credentials, account identifiers, or production evidence.
 
-See the [five-cloud architecture](docs/architecture.md) for the provider signals, data contracts, and rollout gates. The investigation design is based on the [OpenAI SRE agent Cookbook](https://developers.openai.com/cookbook/examples/agents_api/apps/sev_bot/readme).
+See the [five-cloud architecture (Japanese)](docs/architecture.md) for the provider signals, data contracts, and rollout gates. The investigation design is based on the [OpenAI SRE agent Cookbook](https://developers.openai.com/cookbook/examples/agents_api/apps/sev_bot/readme).
