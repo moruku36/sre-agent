@@ -7,6 +7,7 @@ import sqlite3
 import sys
 from collections import defaultdict
 from contextlib import contextmanager
+from decimal import Decimal, InvalidOperation
 from itertools import groupby
 
 PROVIDERS = ("aws", "azure", "gcp", "oci", "sakura")
@@ -82,7 +83,7 @@ def _derive_freshness(observed_at, received_at):
     return "fresh" if lag <= ONE_HOUR else "late"
 
 
-def validate(source, signal):
+def validate(source, signal, *, exact_cost=False):
     """Validate an exact signal body against its separate synthetic source."""
     if not isinstance(source, str) or source not in SOURCES:
         raise ValueError("unknown source")
@@ -127,12 +128,13 @@ def validate(source, signal):
         raise ValueError("observed signal requires value and unit")
 
     if kind in COST_KINDS:
-        if type(value) is bool or not isinstance(value, (int, float)):
+        if exact_cost and type(value) is Decimal:
+            finite = value.is_finite()
+        elif type(value) is bool or not isinstance(value, (int, float)):
             raise ValueError("invalid cost value")
-        if isinstance(value, float):
-            if not math.isfinite(value) or value < 0:
-                raise ValueError("invalid cost value")
-        elif value < 0:
+        else:
+            finite = not isinstance(value, float) or math.isfinite(value)
+        if not finite or value < 0:
             raise ValueError("invalid cost value")
         if not isinstance(unit, str) or unit not in COST_UNITS:
             raise ValueError("invalid cost unit")
@@ -406,14 +408,22 @@ def _unique_json_object(pairs):
     return obj
 
 
-def _validated_signal_rows(db):
+def _reject_non_finite_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _validated_signal_rows(db, *, exact_cost=False):
+    parse_options = (
+        {"parse_float": Decimal, "parse_constant": _reject_non_finite_constant}
+        if exact_cost else {}
+    )
     for source, scope, event_id, body_json in _signal_rows(db):
         if not isinstance(body_json, str):
             raise ValueError("invalid stored signal evidence")
         try:
-            body = json.loads(body_json, object_pairs_hook=_unique_json_object)
-            validate(source, body)
-        except (ValueError, RecursionError):
+            body = json.loads(body_json, object_pairs_hook=_unique_json_object, **parse_options)
+            validate(source, body, exact_cost=exact_cost)
+        except (ValueError, RecursionError, InvalidOperation):
             raise ValueError("invalid stored signal evidence") from None
         if (scope, event_id) != (body["scope"], body["event_id"]):
             raise ValueError("stored signal key does not match body")
@@ -536,6 +546,174 @@ def list_incidents(db):
     return correlate_health(_validated_signal_rows(db))
 
 
+_COST_IDENTITY_FIELDS = ("provider", "scope", "environment", "service", "target")
+_COST_RULE_FIELDS = {
+    *_COST_IDENTITY_FIELDS, "source", "kind", "unit", "threshold", "max_age_seconds",
+}
+_COST_EVIDENCE_FIELDS = (
+    "scope", "event_id", "kind", "observed_at", "received_at", "freshness",
+    "value", "unit", "evidence",
+)
+
+
+def load_cost_policy(path):
+    """Read exact policy numbers without duplicate fields or non-finite literals."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(
+                handle,
+                object_pairs_hook=_unique_json_object,
+                parse_float=Decimal,
+                parse_constant=_reject_non_finite_constant,
+            )
+    except (ValueError, RecursionError, InvalidOperation) as exc:
+        raise ValueError("invalid cost policy JSON") from exc
+
+
+def _cost_identity(source, item):
+    return (source, *(item[field] for field in _COST_IDENTITY_FIELDS))
+
+
+def _cost_threshold(value):
+    if type(value) is float:
+        # Direct Python callers have no JSON literal; use the float's decimal rendering.
+        value = Decimal(str(value))
+    if (type(value) is int or (type(value) is Decimal and value.is_finite())) and value >= 0:
+        return value
+    raise ValueError("cost policy threshold must be a finite nonnegative number")
+
+
+def _validate_cost_policy(policy):
+    if not isinstance(policy, dict) or set(policy) != {"version", "rules"}:
+        raise ValueError("cost policy must contain exactly version and rules")
+    if type(policy["version"]) is not int or policy["version"] != 1:
+        raise ValueError("cost policy version must be integer 1")
+    rules = policy["rules"]
+    if not isinstance(rules, list) or not rules:
+        raise ValueError("cost policy rules must be a nonempty list")
+
+    validated = {}
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) != _COST_RULE_FIELDS:
+            raise ValueError("invalid cost policy rule fields")
+
+        source = rule["source"]
+        if not isinstance(source, str) or source not in SOURCES or SOURCES[source] != rule["provider"]:
+            raise ValueError("cost policy source/provider mismatch")
+        for field in ("scope", "target"):
+            if not _is_synthetic_identifier(rule[field]):
+                raise ValueError(f"cost policy {field} must be a synthetic identifier")
+        for field in ("environment", "service"):
+            if not _is_ascii_identifier(rule[field]):
+                raise ValueError(f"cost policy {field} must be an ASCII identifier")
+        if not isinstance(rule["kind"], str) or rule["kind"] not in COST_KINDS:
+            raise ValueError("invalid cost policy kind")
+        if not isinstance(rule["unit"], str) or rule["unit"] not in COST_UNITS:
+            raise ValueError("invalid cost policy currency")
+        threshold = _cost_threshold(rule["threshold"])
+        max_age = rule["max_age_seconds"]
+        if type(max_age) is not int or max_age < 0:
+            raise ValueError("cost policy max_age_seconds must be a nonnegative integer")
+
+        key = _cost_identity(source, rule) + (rule["kind"],)
+        if key in validated:
+            raise ValueError("duplicate cost policy rule for the same stream and kind")
+        validated[key] = dict(rule, threshold=threshold)
+
+    return [validated[key] for key in sorted(validated)]
+
+
+def _latest_cost_receipts(rows):
+    latest = rows[-1]["received_at"]
+    return [row for row in rows if row["received_at"] == latest]
+
+
+def _classify_cost_rule(rule, rows, cutoff):
+    """Evaluate one rule against its identity's visible, receipt-ordered rows."""
+    if not rows:
+        return "unknown", "no_signal", []
+    matching = [row for row in rows if row["kind"] == rule["kind"]]
+    if not matching:
+        return "unknown", "kind_mismatch", _latest_cost_receipts(rows)
+    latest = _latest_cost_receipts(matching)
+    if len(latest) > 1:
+        return "unknown", "ambiguous_receipt", latest
+
+    row = latest[0]
+    observed = row["observed_at"]
+    if observed is None:
+        return "unknown", "missing_observation", latest
+    if row["freshness"] == "late":
+        return "unknown", "late_observation", latest
+    if row["unit"] != rule["unit"]:
+        return "unknown", "currency_mismatch", latest
+    if (cutoff - _parse_utc(observed)).total_seconds() > rule["max_age_seconds"]:
+        return "unknown", "stale_observation", latest
+
+    # A newer receipt need not describe a newer observation.
+    earlier_known = [item for item in matching[:-1] if item["observed_at"] is not None]
+    newer_observations = [item for item in earlier_known if item["observed_at"] > observed]
+    if newer_observations:
+        return "unknown", "out_of_order_observation", newer_observations + latest
+    same_time_conflicts = [
+        item for item in earlier_known
+        if item["observed_at"] == observed
+        and (item["value"], item["unit"]) != (row["value"], row["unit"])
+    ]
+    if same_time_conflicts:
+        return "unknown", "ambiguous_observation", same_time_conflicts + latest
+
+    if row["value"] > rule["threshold"]:
+        return "anomaly", "above_threshold", latest
+    return "within_limit", "at_or_below_threshold", latest
+
+
+def list_cost_anomalies(db, policy, as_of):
+    """Classify expected cost streams using one read-only historical snapshot."""
+    rules = _validate_cost_policy(policy)
+    cutoff = _parse_utc(as_of)
+
+    by_identity = defaultdict(list)
+    for source, body in _validated_signal_rows(db, exact_cost=True):
+        if body["kind"] in COST_KINDS and body["received_at"] <= as_of:
+            by_identity[_cost_identity(source, body)].append(body)
+    for rows in by_identity.values():
+        rows.sort(key=lambda body: (body["received_at"], body["event_id"]))
+
+    classifications = []
+    for rule in rules:
+        source = rule["source"]
+        rows = by_identity.get(_cost_identity(source, rule), [])
+        status, reason, evidence = _classify_cost_rule(rule, rows, cutoff)
+        classifications.append({
+            "rule": rule,
+            "status": status,
+            "reason": reason,
+            "evidence": [
+                {"source": source, **{field: body[field] for field in _COST_EVIDENCE_FIELDS}}
+                for body in evidence
+            ],
+        })
+    return {"version": 1, "as_of": as_of, "classifications": classifications}
+
+
+def _encode_cost_json(value):
+    """Serialize a cost result without turning Decimal amounts into floats or strings."""
+    if type(value) is Decimal:
+        if not value.is_finite():
+            raise ValueError("cannot encode a non-finite cost number")
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ",".join(_encode_cost_json(item) for item in value) + "]"
+    if isinstance(value, dict):
+        fields = (
+            _canonical_json(key) + ":" + _encode_cost_json(item)
+            for key, item in sorted(value.items())
+        )
+        return "{" + ",".join(fields) + "}"
+    return _canonical_json(value)
+
+
 def _write_json(obj):
     print(json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True))
 
@@ -543,16 +721,26 @@ def _write_json(obj):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="sre_mvp.py")
     parser.add_argument("--db", required=True)
-    parser.add_argument("command", choices=("demo", "list", "incidents"))
+    parser.add_argument("command", choices=("demo", "list", "incidents", "cost"))
+    parser.add_argument("--policy", help="JSON cost policy (required for cost)")
+    parser.add_argument("--as-of", help="UTC snapshot time YYYY-MM-DDTHH:MM:SSZ (required for cost)")
     args = parser.parse_args(argv)
+    if args.command == "cost":
+        if args.policy is None or args.as_of is None:
+            parser.error("cost requires --policy and --as-of")
+    elif args.policy is not None or args.as_of is not None:
+        parser.error("--policy and --as-of are only used by cost")
 
     try:
         if args.command == "demo":
             _write_json(ingest(args.db, synthetic_signals()))
         elif args.command == "list":
             _write_json(list_signals(args.db))
-        else:
+        elif args.command == "incidents":
             _write_json(list_incidents(args.db))
+        else:
+            result = list_cost_anomalies(args.db, load_cost_policy(args.policy), args.as_of)
+            print(_encode_cost_json(result))
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

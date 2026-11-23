@@ -37,6 +37,7 @@ python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" demo
 python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" demo
 python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" list
 python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" incidents
+python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" cost --policy cost_policy.json --as-of 2026-01-15T13:05:00Z
 python3 -B -m unittest -v
 ```
 
@@ -46,7 +47,19 @@ The read-only `incidents` command produces one versioned JSON object with `incid
 
 Outages group only within the same provider, source, scope, environment, service, and target. Events are replayed by observation time, not receipt order. Only a strictly later fresh recovery with no simultaneous outage can resolve an incident; a later recurrence starts a new one. Missing observations, late recoveries, ambiguous recoveries, and recoveries with no open incident are reported separately with reasons. This is a historical snapshot: backfilling an earlier opening outage can change an incident ID. An empty incident list does not establish current health.
 
-The command fails rather than treating a missing database or invalid stored evidence as an empty incident list. Raw cost signals are still available via `list`; no cost anomaly is classified without a policy. No commands call OpenClaw, the OpenAI Agents API, or run remediation.
+The command fails rather than treating a missing database or invalid stored evidence as an empty incident list. Raw cost signals are still available via `list`. No commands call OpenClaw, the OpenAI Agents API, or run remediation.
+
+### Cost policy
+
+The read-only `cost` command requires a policy file and a fixed UTC `--as-of` timestamp. It returns one decision per version 1 policy rule with the matching evidence. Each rule specifies the provider, source, scope, environment, service, target, cost kind, expected currency (`unit`), inclusive numeric `threshold`, and maximum observation age in seconds (`max_age_seconds`). A qualified observation above the threshold is an `anomaly`; one at or below it is `within_limit` for that rule only. Actual, forecast, and estimate are evaluated separately: a forecast anomaly is not a confirmed charge. The demo compares individual signal values; v1 has no billing-period field, aggregation, or currency conversion.
+
+Only evidence received at or before the cutoff can affect a decision. Within a rule's stream, the latest receipt is evaluated without falling back to an earlier value. No visible signal or a missing, late, stale, ambiguous, out-of-order, or mismatched observation yields `unknown`, never zero or within limit. Late means delivery took more than one hour; stale means the observation is older than the rule allows at the cutoff. An unrelated cost kind cannot satisfy a rule. The entire store is still validated, including unrelated rows and receipts after the cutoff. Missing databases, malformed policies, and invalid stored evidence are errors, not empty results.
+
+Threshold checks and same-observation conflict checks compare the exact decimal numbers in the policy JSON and the JSON actually stored in SQLite. The result emits those amounts as JSON numbers without rounding them to binary floats; use a decimal-aware reader to preserve that precision. Any precision lost before storage cannot be recovered. Existing databases do not need a migration.
+
+SQLite is opened with `mode=ro`, which prevents data and schema writes. In WAL mode SQLite may still require or create `-wal` and `-shm` sidecar files.
+
+The bundled synthetic policy produces five decisions: AWS is unknown (missing observation), Azure's JPY forecast is an anomaly, GCP is unknown (late estimate), OCI is unknown (the demo expects a forecast, but none was received), and Sakura's JPY forecast is within limit. Repeating the cost command at the same cutoff after replaying the demo gives identical JSON.
 
 ## Development plan
 
