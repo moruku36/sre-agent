@@ -34,12 +34,17 @@ demo_dir="$(mktemp -d)"
 python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" demo
 python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" demo
 python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" list
+python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" incidents
 python3 -B -m unittest -v
 ```
 
 The first run stores 25 synthetic signals and skips five replays. The second stores nothing new and skips all 30 inputs. Each provider contributes cost, outage, recovery, late, and missing observations. Late observations retain their value; missing observations are unknown, not zero or healthy. Replays never overwrite the original event.
 
-This demo only validates and stores signals. It does not correlate incidents, call OpenClaw or the OpenAI Agents API, or run remediation.
+The read-only `incidents` command produces one versioned JSON object with `incidents` and `unapplied_health_evidence`. The demo yields five resolved incidents, one per provider. An incident is keyed by its opening outage's stored source, scope, and event ID. Its evidence includes those stored keys and the observed and received UTC times for each event.
+
+Outages group only within the same provider, source, scope, environment, service, and target. Events are replayed by observation time, not receipt order. Only a strictly later fresh recovery with no simultaneous outage can resolve an incident; a later recurrence starts a new one. Missing observations, late recoveries, ambiguous recoveries, and recoveries with no open incident are reported separately with reasons. This is a historical snapshot: backfilling an earlier opening outage can change an incident ID. An empty incident list does not establish current health.
+
+The command fails rather than treating a missing database or invalid stored evidence as an empty incident list. Raw cost signals are still available via `list`; no cost anomaly is classified without a policy. No commands call OpenClaw, the OpenAI Agents API, or run remediation.
 
 ## Development plan
 

@@ -5,7 +5,9 @@ import math
 import re
 import sqlite3
 import sys
+from collections import defaultdict
 from contextlib import contextmanager
+from itertools import groupby
 
 PROVIDERS = ("aws", "azure", "gcp", "oci", "sakura")
 
@@ -372,26 +374,166 @@ def ingest(db, samples):
     return {"inserted": inserted, "duplicates": duplicates}
 
 
+def _signal_rows(db):
+    with _connect(db) as conn:
+        return conn.execute(
+            """
+            SELECT source, scope, event_id, body_json
+            FROM signals
+            ORDER BY source, scope, event_id
+            """
+        ).fetchall()
+
+
 def list_signals(db):
     """Return stored signals as a list of dicts.
 
     Each item is the stored signal body plus an envelope key "source".
     Ordering is deterministic: source, scope, event_id.
     """
-    with _connect(db) as conn:
-        rows = conn.execute(
-            """
-            SELECT source, body_json
-            FROM signals
-            ORDER BY source, scope, event_id
-            """
-        ).fetchall()
     out = []
-    for source, body_json in rows:
+    for source, _, _, body_json in _signal_rows(db):
         body = json.loads(body_json)
         body["source"] = source
         out.append(body)
     return out
+
+
+def _unique_json_object(pairs):
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise ValueError("duplicate signal fields")
+    return obj
+
+
+def _validated_signal_rows(db):
+    for source, scope, event_id, body_json in _signal_rows(db):
+        if not isinstance(body_json, str):
+            raise ValueError("invalid stored signal evidence")
+        try:
+            body = json.loads(body_json, object_pairs_hook=_unique_json_object)
+            validate(source, body)
+        except (ValueError, RecursionError):
+            raise ValueError("invalid stored signal evidence") from None
+        if (scope, event_id) != (body["scope"], body["event_id"]):
+            raise ValueError("stored signal key does not match body")
+        yield source, body
+
+
+def correlate_health(rows):
+    """Correlate validated (source, body) rows in observation order.
+
+    Sort by health key, observation time (unknown last), then event ID.
+    Receipt time affects freshness but does not order state transitions.
+    """
+    health_key_fields = (
+        "provider",
+        "source",
+        "scope",
+        "environment",
+        "service",
+        "target",
+    )
+
+    evidence_fields = (
+        "source",
+        "scope",
+        "event_id",
+        "kind",
+        "observed_at",
+        "received_at",
+        "freshness",
+        "evidence",
+    )
+
+    def evidence_item(body):
+        return {field: body[field] for field in evidence_fields}
+
+    def unapplied_item(body, reason):
+        item = evidence_item(body)
+        for field in health_key_fields:
+            item[field] = body[field]
+        item["reason"] = reason
+        return item
+
+    def observed_sort_key(body):
+        observed_at = body["observed_at"]
+        return observed_at is None, observed_at or "", body["event_id"]
+
+    grouped = defaultdict(list)
+    for source, body in rows:
+        if body["kind"] in COST_KINDS:
+            continue
+        enriched_body = dict(body, source=source)
+        key = tuple(enriched_body[field] for field in health_key_fields)
+        grouped[key].append(enriched_body)
+
+    incidents = []
+    unapplied_health_evidence = []
+
+    for key, bodies in sorted(grouped.items()):
+        bodies.sort(key=observed_sort_key)
+        identity = dict(zip(health_key_fields, key))
+        open_incident = None
+
+        # A timestamp bucket makes simultaneous outage/recovery evidence explicit.
+        for observed_at, bucket in groupby(bodies, key=lambda body: body["observed_at"]):
+            if observed_at is None:
+                unapplied_health_evidence.extend(
+                    unapplied_item(body, "missing_observation") for body in bucket
+                )
+                continue
+
+            events = list(bucket)
+            outages = [body for body in events if body["kind"] == "outage"]
+            recoveries = [body for body in events if body["kind"] == "recovery"]
+
+            if outages:
+                if open_incident is None:
+                    incident_id = "health:{source}/{scope}/{event_id}".format_map(outages[0])
+                    open_incident = {
+                        **identity,
+                        "incident_id": incident_id,
+                        "status": "open",
+                        "opened_at": observed_at,
+                        "last_outage_at": observed_at,
+                        "resolved_at": None,
+                        "evidence": [],
+                    }
+                    incidents.append(open_incident)
+
+                open_incident["evidence"].extend(evidence_item(body) for body in outages)
+                open_incident["last_outage_at"] = observed_at
+
+            appended_recovery = False
+            for body in recoveries:
+                if body["freshness"] == "late":
+                    reason = "late_recovery"
+                elif outages:
+                    reason = "ambiguous_recovery"
+                elif open_incident is None:
+                    reason = "no_open_incident"
+                else:
+                    open_incident["evidence"].append(evidence_item(body))
+                    appended_recovery = True
+                    continue
+                unapplied_health_evidence.append(unapplied_item(body, reason))
+
+            if appended_recovery:
+                open_incident["status"] = "resolved"
+                open_incident["resolved_at"] = observed_at
+                open_incident = None
+
+    return {
+        "version": 1,
+        "incidents": incidents,
+        "unapplied_health_evidence": unapplied_health_evidence,
+    }
+
+
+def list_incidents(db):
+    """Correlate a read-only snapshot of the existing synthetic signal store."""
+    return correlate_health(_validated_signal_rows(db))
 
 
 def _write_json(obj):
@@ -401,14 +543,16 @@ def _write_json(obj):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="sre_mvp.py")
     parser.add_argument("--db", required=True)
-    parser.add_argument("command", choices=("demo", "list"))
+    parser.add_argument("command", choices=("demo", "list", "incidents"))
     args = parser.parse_args(argv)
 
     try:
         if args.command == "demo":
             _write_json(ingest(args.db, synthetic_signals()))
-        else:
+        elif args.command == "list":
             _write_json(list_signals(args.db))
+        else:
+            _write_json(list_incidents(args.db))
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
