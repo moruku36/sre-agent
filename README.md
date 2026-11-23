@@ -61,6 +61,21 @@ SQLite is opened with `mode=ro`, which prevents data and schema writes. In WAL m
 
 The bundled synthetic policy produces five decisions: AWS is unknown (missing observation), Azure's JPY forecast is an anomaly, GCP is unknown (late estimate), OCI is unknown (the demo expects a forecast, but none was received), and Sakura's JPY forecast is within limit. Repeating the cost command at the same cutoff after replaying the demo gives identical JSON.
 
+### Local synthetic handoff for OpenClaw
+
+After running the demo, pull one historical incident and cost snapshot:
+
+```sh
+python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" handoff \
+  --policy cost_policy.json --as-of 2026-01-15T12:21:00Z
+```
+
+Read stdout as a single JSON object and check `kind: "synthetic_sre_handoff"` and `version: 1`. The object contains `as_of`, the `incidents` and `unapplied_health_evidence` from health correlation, and `cost_classifications` in the same form as the `cost` command's `classifications`. Use a decimal-aware reader for the numeric fields (for example, Python's `json.load(stream, parse_float=Decimal)`).
+
+Both parts use one read-only SQLite snapshot and only evidence with `received_at <= as_of`, after validating the whole stored snapshot. The demo's five incidents are open at `12:21:00Z` and resolved at `12:22:00Z`, when the recoveries are received. The envelope retains synthetic evidence IDs, references, and reasons for unknown decisions. An empty incident list does not indicate current health. Invalid or missing input exits nonzero without an envelope.
+
+This is a local pull contract for synthetic fixtures, not an authenticated OpenClaw integration. It sends no data, accepts no acknowledgment, and makes no changes to signals or the schema. The same store, policy, and cutoff produce the same JSON; SQLite's WAL sidecar behavior described above still applies.
+
 ## Development plan
 
 1. Start locally with synthetic incidents and credential-free tests.

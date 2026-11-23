@@ -668,14 +668,17 @@ def _classify_cost_rule(rule, rows, cutoff):
     return "within_limit", "at_or_below_threshold", latest
 
 
-def list_cost_anomalies(db, policy, as_of):
-    """Classify expected cost streams using one read-only historical snapshot."""
-    rules = _validate_cost_policy(policy)
-    cutoff = _parse_utc(as_of)
-
-    by_identity = defaultdict(list)
+def _received_signal_rows(db, as_of):
+    # Validate every stored row before considering its inclusive receipt cutoff.
     for source, body in _validated_signal_rows(db, exact_cost=True):
-        if body["kind"] in COST_KINDS and body["received_at"] <= as_of:
+        if body["received_at"] <= as_of:
+            yield source, body
+
+
+def _classify_cost_rows(rules, visible_rows, cutoff):
+    by_identity = defaultdict(list)
+    for source, body in visible_rows:
+        if body["kind"] in COST_KINDS:
             by_identity[_cost_identity(source, body)].append(body)
     for rows in by_identity.values():
         rows.sort(key=lambda body: (body["received_at"], body["event_id"]))
@@ -694,11 +697,35 @@ def list_cost_anomalies(db, policy, as_of):
                 for body in evidence
             ],
         })
+    return classifications
+
+
+def list_cost_anomalies(db, policy, as_of):
+    """Classify expected cost streams using one read-only historical snapshot."""
+    rules = _validate_cost_policy(policy)
+    cutoff = _parse_utc(as_of)
+    classifications = _classify_cost_rows(rules, _received_signal_rows(db, as_of), cutoff)
     return {"version": 1, "as_of": as_of, "classifications": classifications}
 
 
+def synthetic_handoff(db, policy, as_of):
+    """Build a historical synthetic handoff from one read-only store snapshot."""
+    rules = _validate_cost_policy(policy)
+    cutoff = _parse_utc(as_of)
+    rows = tuple(_received_signal_rows(db, as_of))
+    health = correlate_health(rows)
+    return {
+        "kind": "synthetic_sre_handoff",
+        "version": 1,
+        "as_of": as_of,
+        "incidents": health["incidents"],
+        "unapplied_health_evidence": health["unapplied_health_evidence"],
+        "cost_classifications": _classify_cost_rows(rules, rows, cutoff),
+    }
+
+
 def _encode_cost_json(value):
-    """Serialize a cost result without turning Decimal amounts into floats or strings."""
+    """Serialize results without turning Decimal amounts into floats or strings."""
     if type(value) is Decimal:
         if not value.is_finite():
             raise ValueError("cannot encode a non-finite cost number")
@@ -721,15 +748,15 @@ def _write_json(obj):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="sre_mvp.py")
     parser.add_argument("--db", required=True)
-    parser.add_argument("command", choices=("demo", "list", "incidents", "cost"))
-    parser.add_argument("--policy", help="JSON cost policy (required for cost)")
-    parser.add_argument("--as-of", help="UTC snapshot time YYYY-MM-DDTHH:MM:SSZ (required for cost)")
+    parser.add_argument("command", choices=("demo", "list", "incidents", "cost", "handoff"))
+    parser.add_argument("--policy", help="JSON cost policy (required for cost and handoff)")
+    parser.add_argument("--as-of", help="UTC snapshot time YYYY-MM-DDTHH:MM:SSZ (required for cost and handoff)")
     args = parser.parse_args(argv)
-    if args.command == "cost":
+    if args.command in ("cost", "handoff"):
         if args.policy is None or args.as_of is None:
-            parser.error("cost requires --policy and --as-of")
+            parser.error(f"{args.command} requires --policy and --as-of")
     elif args.policy is not None or args.as_of is not None:
-        parser.error("--policy and --as-of are only used by cost")
+        parser.error("--policy and --as-of are only used by cost and handoff")
 
     try:
         if args.command == "demo":
@@ -739,7 +766,8 @@ def main(argv=None):
         elif args.command == "incidents":
             _write_json(list_incidents(args.db))
         else:
-            result = list_cost_anomalies(args.db, load_cost_policy(args.policy), args.as_of)
+            read_snapshot = list_cost_anomalies if args.command == "cost" else synthetic_handoff
+            result = read_snapshot(args.db, load_cost_policy(args.policy), args.as_of)
             print(_encode_cost_json(result))
     except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
