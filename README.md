@@ -2,7 +2,7 @@
 
 A multi-cloud incident operations harness for OpenClaw. It is designed to detect cost spikes and service failures across AWS, Azure, Google Cloud, Oracle Cloud Infrastructure, and Sakura Cloud.
 
-**Status:** The architecture is documented. Live integrations and remediation are not enabled.
+**Status:** A local synthetic signal demo is available. Live integrations and remediation are not enabled.
 
 ## Architecture
 
@@ -23,6 +23,23 @@ flowchart LR
 - Cloud adapters normalize billing, resource health, and service signals. Stale or missing data is reported as unknown, not healthy or free.
 - OpenClaw manages incidents and escalations without a Slack dependency. The OpenAI Agents API investigates evidence and proposes next steps; it does not approve or execute changes.
 - A separate policy gate allows only explicitly scoped remediation. Higher-impact or uncertain actions go to the operator; a missing reply is not approval. Each applied action must be verified.
+
+## Run the synthetic demo
+
+Requires Python 3.10+ with SQLite support. No dependencies or credentials are needed. From the repository root, run:
+
+```sh
+cd examples/synthetic_signals
+demo_dir="$(mktemp -d)"
+python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" demo
+python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" demo
+python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" list
+python3 -B -m unittest -v
+```
+
+The first run stores 25 synthetic signals and skips five replays. The second stores nothing new and skips all 30 inputs. Each provider contributes cost, outage, recovery, late, and missing observations. Late observations retain their value; missing observations are unknown, not zero or healthy. Replays never overwrite the original event.
+
+This demo only validates and stores signals. It does not correlate incidents, call OpenClaw or the OpenAI Agents API, or run remediation.
 
 ## Development plan
 
