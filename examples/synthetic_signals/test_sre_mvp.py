@@ -3,8 +3,9 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import sre_mvp
 from sre_mvp import ingest, list_signals, synthetic_signals, validate
@@ -29,6 +30,27 @@ def sample(provider, event_id, scope="synthetic-scope-a", kind="cost_actual",
         "value": value,
         "unit": unit,
     }
+
+
+def health_sample(event_id, kind, observed_minute, received_minute, *,
+                  source="synthetic-aws-01", **dimensions):
+    def timestamp(minutes):
+        return f"2024-01-01T{minutes // 60:02d}:{minutes % 60:02d}:00Z"
+
+    missing = observed_minute is None
+    if missing:
+        freshness = "unknown"
+    else:
+        freshness = "late" if received_minute - observed_minute > 60 else "fresh"
+    body = sample(
+        sre_mvp.SOURCES[source], event_id, kind=kind,
+        value=None if missing else int(kind == "outage"),
+        unit=None if missing else "state",
+        observed_at=None if missing else timestamp(observed_minute),
+        received_at=timestamp(received_minute), freshness=freshness,
+    )
+    body.update(dimensions)
+    return source, body
 
 
 class SreMvpTests(unittest.TestCase):
@@ -243,6 +265,180 @@ class SreMvpTests(unittest.TestCase):
             self.assertEqual(0, sre_mvp.main(["--db", db, "list"]))
         payload = json.loads(listed.getvalue())
         self.assertEqual(25, len(payload))
+
+
+class SreIncidentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "signals.db"
+
+    def test_groups_outages_by_observed_time_and_splits_recurrence(self):
+        rows = [
+            health_sample("evt-recurrence", "outage", 30, 31),
+            health_sample("evt-recovery-b", "recovery", 20, 22),
+            health_sample("evt-recovery-late", "recovery", 20, 85),
+            health_sample("evt-repeat", "outage", 15, 30),
+            health_sample("evt-before", "recovery", 5, 45),
+            health_sample("evt-recovery-a", "recovery", 20, 21),
+            health_sample("evt-first", "outage", 10, 38),
+        ]
+        ingest(self.db, rows)
+        output = sre_mvp.list_incidents(self.db)
+        first, second = output["incidents"]
+
+        self.assertEqual("resolved", first["status"])
+        self.assertEqual("2024-01-01T00:10:00Z", first["opened_at"])
+        self.assertEqual("2024-01-01T00:15:00Z", first["last_outage_at"])
+        self.assertEqual("2024-01-01T00:20:00Z", first["resolved_at"])
+        self.assertEqual(
+            ["evt-first", "evt-repeat", "evt-recovery-a", "evt-recovery-b"],
+            [event["event_id"] for event in first["evidence"]],
+        )
+        opening = first["evidence"][0]
+        self.assertEqual("2024-01-01T00:38:00Z", opening["received_at"])
+        self.assertEqual(
+            ("synthetic-aws-01", "synthetic-scope-a", "evt-first"),
+            (opening["source"], opening["scope"], opening["event_id"]),
+        )
+        self.assertEqual("open", second["status"])
+        self.assertIsNone(second["resolved_at"])
+        self.assertEqual("evt-recurrence", second["evidence"][0]["event_id"])
+        self.assertNotEqual(first["incident_id"], second["incident_id"])
+        self.assertEqual(
+            [("evt-before", "no_open_incident"), ("evt-recovery-late", "late_recovery")],
+            [(event["event_id"], event["reason"])
+             for event in output["unapplied_health_evidence"]],
+        )
+
+        ingest(self.db, rows)
+        self.assertEqual(output, sre_mvp.list_incidents(self.db))
+
+    def test_same_observation_time_conflicts_leave_incident_open(self):
+        rows = [
+            health_sample("evt-z-first", "outage", 10, 15),
+            health_sample("evt-a-first", "outage", 10, 25),
+            health_sample("evt-0-conflict", "recovery", 10, 12),
+            health_sample("evt-repeat", "outage", 20, 21),
+            health_sample("evt-last-conflict", "recovery", 20, 28),
+        ]
+        ingest(self.db, rows)
+        output = sre_mvp.list_incidents(self.db)
+        (incident,) = output["incidents"]
+        self.assertEqual("open", incident["status"])
+        self.assertIsNone(incident["resolved_at"])
+        self.assertEqual("health:synthetic-aws-01/synthetic-scope-a/evt-a-first",
+                         incident["incident_id"])
+        self.assertEqual(
+            ["evt-0-conflict", "evt-last-conflict"],
+            [event["event_id"] for event in output["unapplied_health_evidence"]],
+        )
+        self.assertTrue(all(event["reason"] == "ambiguous_recovery"
+                            for event in output["unapplied_health_evidence"]))
+
+        another = self.db.with_name("reversed.db")
+        ingest(another, reversed(rows))
+        self.assertEqual(output, sre_mvp.list_incidents(another))
+        ingest(self.db, [health_sample("evt-recovery", "recovery", 21, 22)])
+        (resolved,) = sre_mvp.list_incidents(self.db)["incidents"]
+        self.assertEqual(incident["incident_id"], resolved["incident_id"])
+        self.assertEqual("2024-01-01T00:21:00Z", resolved["resolved_at"])
+
+    def test_missing_and_late_health_evidence_cannot_resolve(self):
+        ingest(self.db, [
+            health_sample("evt-late-outage", "outage", 10, 100),
+            health_sample("evt-missing-recovery", "recovery", None, 22),
+            health_sample("evt-late-recovery", "recovery", 20, 81),
+            health_sample("evt-missing-outage", "outage", None, 23,
+                          target="synthetic-other-target"),
+        ])
+        output = sre_mvp.list_incidents(self.db)
+        (incident,) = output["incidents"]
+        self.assertEqual("open", incident["status"])
+        self.assertIsNone(incident["resolved_at"])
+        (evidence,) = incident["evidence"]
+        self.assertEqual("evt-late-outage", evidence["event_id"])
+        self.assertEqual("late", evidence["freshness"])
+        unapplied = {event["event_id"]: event for event in output["unapplied_health_evidence"]}
+        self.assertEqual("late_recovery", unapplied["evt-late-recovery"]["reason"])
+        for event_id in ("evt-missing-outage", "evt-missing-recovery"):
+            self.assertEqual("missing_observation", unapplied[event_id]["reason"])
+            self.assertIsNone(unapplied[event_id]["observed_at"])
+
+    def test_matching_requires_all_health_dimensions(self):
+        with patch.dict(sre_mvp.SOURCES, {"synthetic-aws-02": "aws"}):
+            ingest(self.db, [
+                health_sample("evt-outage", "outage", 10, 10),
+                health_sample("evt-provider", "recovery", 20, 20, source="synthetic-azure-01"),
+                health_sample("evt-source", "recovery", 20, 20, source="synthetic-aws-02"),
+                health_sample("evt-scope", "recovery", 20, 20, scope="synthetic-scope-b"),
+                health_sample("evt-environment", "recovery", 20, 20, environment="staging"),
+                health_sample("evt-service", "recovery", 20, 20, service="other"),
+                health_sample("evt-target", "recovery", 20, 20, target="synthetic-other-target"),
+            ])
+            output = sre_mvp.list_incidents(self.db)
+
+        (incident,) = output["incidents"]
+        self.assertEqual("open", incident["status"])
+        self.assertEqual(6, len(output["unapplied_health_evidence"]))
+        self.assertTrue(all(event["reason"] == "no_open_incident"
+                            for event in output["unapplied_health_evidence"]))
+
+    def test_incidents_cli_does_not_modify_demo_db(self):
+        db = self.db.with_name("demo ?# evidence.sqlite3")
+        ingest(db, synthetic_signals())
+        db_bytes = db.read_bytes()
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(0, sre_mvp.main(["--db", str(db), "incidents"]))
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(1, output["version"])
+        self.assertEqual(5, len(output["incidents"]))
+        self.assertEqual({"resolved"}, {row["status"] for row in output["incidents"]})
+        self.assertEqual([], output["unapplied_health_evidence"])
+        self.assertEqual(db_bytes, db.read_bytes())
+        self.assertEqual([db], list(db.parent.iterdir()))
+
+    def test_cost_only_snapshot_keeps_raw_cost_without_health_classification(self):
+        cost = synthetic_signals()[0]
+        ingest(self.db, [cost])
+        self.assertEqual(
+            {"version": 1, "incidents": [], "unapplied_health_evidence": []},
+            sre_mvp.list_incidents(self.db),
+        )
+        self.assertEqual(cost[1]["value"], list_signals(self.db)[0]["value"])
+
+    def test_incidents_cli_missing_db_fails_without_creating_it(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(1, sre_mvp.main(["--db", str(self.db), "incidents"]))
+        self.assertFalse(self.db.exists())
+        self.assertEqual("", stdout.getvalue())
+        self.assertTrue(stderr.getvalue().startswith("error: "))
+
+    def test_incidents_cli_rejects_invalid_stored_evidence(self):
+        source, recovery = health_sample("evt-recovery", "recovery", 20, 20)
+        cases = {
+            "malformed": "{",
+            "non-object": "[]",
+            "duplicate-kind": '{"kind":"outage",' + json.dumps(recovery)[1:],
+            "wrong-key": json.dumps(dict(recovery, event_id="evt-different")),
+            "bad-freshness": json.dumps(dict(recovery, freshness="late")),
+        }
+        for case, body_json in cases.items():
+            with self.subTest(case=case):
+                db = self.db.with_name(f"{case}.db")
+                ingest(db, [health_sample("evt-outage", "outage", 10, 10), (source, recovery)])
+                with sqlite3.connect(db) as conn:
+                    conn.execute("UPDATE signals SET body_json = ? WHERE event_id = ?",
+                                 (body_json, recovery["event_id"]))
+                conn.close()
+
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    self.assertEqual(1, sre_mvp.main(["--db", str(db), "incidents"]))
+                self.assertEqual("", stdout.getvalue())
+                self.assertTrue(stderr.getvalue().startswith("error: "))
 
 
 if __name__ == "__main__":
