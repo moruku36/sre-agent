@@ -90,6 +90,22 @@ python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" get-incident \
 
 料金ポリシーは不要です。読み取り専用のスナップショットを、指定時刻より後に受信した行も含めて検証し、`as_of` 以前（指定時刻と同時を含む）に受信した根拠だけを相関に使います。他のインシデント、判定に使われなかった根拠、料金判定の結果は返しません。時刻・ID・DBの内容が不正な場合や、必須オプション・DBがない場合は、JSONを出力せずにエラー終了します。これはローカルの模擬データを読み取る機能であり、実際のOpenClaw連携ではありません。
 
+### ローカル模擬調査レポート
+
+上のデモDBからハンドオフを取得し、バイト列を変更せずに保存します。呼び出し側が指定したインシデント1件について、同梱の模擬応答を照合します。
+
+```sh
+python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" handoff \
+  --policy cost_policy.json --as-of 2026-01-15T12:21:00Z > "$demo_dir/handoff.json"
+python3 -B sre_investigation.py --handoff "$demo_dir/handoff.json" \
+  --response investigation_mock.json \
+  --incident-id 'health:synthetic-aws-01/synthetic-aws-prod/synthetic-aws-outage-0001'
+```
+
+同梱の[模擬応答](examples/synthetic_signals/investigation_mock.json)は手書きで、APIによる生成ではありません。別のスナップショットを試す場合は、末尾の改行も含めたファイルの正確なバイト列のSHA-256を `handoff_sha256` に記録し、そのファイル内の完全なインシデントIDを指定してください。JSONを整形し直すだけでもハッシュは変わります。`--incident-id` と模擬応答のIDは一致する必要があります。引用では `source`、`scope`、`event_id`、不透明な参照文字列 `evidence` の4項目すべてを指定します。その案件に紐づき、`as_of` までに受信した根拠だけを引用できます。料金、相関に使われなかった根拠、別案件の根拠は対象外です。
+
+レポートの `observed_evidence` には、引用元の記録をハンドオフと同じ順序で、受信時刻・鮮度とともに載せます。原因候補（支持・反証の引用を含む）、不明点、次の確認事項は別枠で、事実や命令としては扱いません。`references_validated` は紐づけを確かめたことを示すだけで、作成者の認証、因果関係の証明、現時点の正常性の確認ではありません。応答が未完了の場合、IDの欠落・重複、引用の不一致、未定義の応答フィールドがある場合は、レポートを出力せずエラーになります。このコマンドは2つのローカルJSONだけを読み、参照先へのアクセス、モデル呼び出し、承認、復旧操作は行いません。
+
 ## 開発計画
 
 1. 模擬インシデントと認証不要のローカルテストから始める。
