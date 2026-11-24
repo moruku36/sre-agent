@@ -417,6 +417,7 @@ def _validated_signal_rows(db, *, exact_cost=False):
         {"parse_float": Decimal, "parse_constant": _reject_non_finite_constant}
         if exact_cost else {}
     )
+    seen_keys = set()
     for source, scope, event_id, body_json in _signal_rows(db):
         if not isinstance(body_json, str):
             raise ValueError("invalid stored signal evidence")
@@ -427,6 +428,10 @@ def _validated_signal_rows(db, *, exact_cost=False):
             raise ValueError("invalid stored signal evidence") from None
         if (scope, event_id) != (body["scope"], body["event_id"]):
             raise ValueError("stored signal key does not match body")
+        key = (source, scope, event_id)
+        if key in seen_keys:
+            raise ValueError("duplicate stored signal key")
+        seen_keys.add(key)
         yield source, body
 
 
@@ -724,6 +729,36 @@ def synthetic_handoff(db, policy, as_of):
     }
 
 
+def get_incident(db, as_of, incident_id):
+    """Return one exact incident from a read-only historical snapshot."""
+    _parse_utc(as_of)
+    prefix = "health:"
+    if not isinstance(incident_id, str) or not incident_id.startswith(prefix):
+        raise ValueError("invalid incident ID")
+    parts = incident_id[len(prefix):].split("/", 2)
+    if (
+        len(parts) != 3
+        or not _is_synthetic_identifier(parts[0])
+        or not _is_synthetic_identifier(parts[1])
+        or not _is_ascii_identifier(parts[2])
+    ):
+        raise ValueError("invalid incident ID")
+
+    health = correlate_health(_received_signal_rows(db, as_of))
+    incident = next(
+        (item for item in health["incidents"] if item["incident_id"] == incident_id),
+        None,
+    )
+    return {
+        "kind": "synthetic_sre_incident_detail",
+        "version": 1,
+        "as_of": as_of,
+        "incident_id": incident_id,
+        "status": "found" if incident is not None else "not_found",
+        "incident": incident,
+    }
+
+
 def _encode_cost_json(value):
     """Serialize results without turning Decimal amounts into floats or strings."""
     if type(value) is Decimal:
@@ -748,15 +783,27 @@ def _write_json(obj):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="sre_mvp.py")
     parser.add_argument("--db", required=True)
-    parser.add_argument("command", choices=("demo", "list", "incidents", "cost", "handoff"))
+    parser.add_argument(
+        "command", choices=("demo", "list", "incidents", "cost", "handoff", "get-incident"),
+    )
     parser.add_argument("--policy", help="JSON cost policy (required for cost and handoff)")
-    parser.add_argument("--as-of", help="UTC snapshot time YYYY-MM-DDTHH:MM:SSZ (required for cost and handoff)")
+    parser.add_argument(
+        "--as-of", help="UTC snapshot time YYYY-MM-DDTHH:MM:SSZ (required for cost, handoff, and get-incident)",
+    )
+    parser.add_argument("--incident-id", help="Exact incident ID (required for get-incident)")
     args = parser.parse_args(argv)
+    if args.incident_id is not None and args.command != "get-incident":
+        parser.error("--incident-id is only used by get-incident")
     if args.command in ("cost", "handoff"):
         if args.policy is None or args.as_of is None:
             parser.error(f"{args.command} requires --policy and --as-of")
+    elif args.command == "get-incident":
+        if args.as_of is None or args.incident_id is None:
+            parser.error("get-incident requires --as-of and --incident-id")
+        if args.policy is not None:
+            parser.error("--policy is not used by get-incident")
     elif args.policy is not None or args.as_of is not None:
-        parser.error("--policy and --as-of are only used by cost and handoff")
+        parser.error(f"{args.command} does not use --policy or --as-of")
 
     try:
         if args.command == "demo":
@@ -765,6 +812,8 @@ def main(argv=None):
             _write_json(list_signals(args.db))
         elif args.command == "incidents":
             _write_json(list_incidents(args.db))
+        elif args.command == "get-incident":
+            _write_json(get_incident(args.db, args.as_of, args.incident_id))
         else:
             read_snapshot = list_cost_anomalies if args.command == "cost" else synthetic_handoff
             result = read_snapshot(args.db, load_cost_policy(args.policy), args.as_of)

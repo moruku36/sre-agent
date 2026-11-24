@@ -76,6 +76,20 @@ Both parts use one read-only SQLite snapshot and only evidence with `received_at
 
 This is a local pull contract for synthetic fixtures, not an authenticated OpenClaw integration. It sends no data, accepts no acknowledgment, and makes no changes to signals or the schema. The same store, policy, and cutoff produce the same JSON; SQLite's WAL sidecar behavior described above still applies.
 
+### Look up one synthetic incident
+
+Copy an `incident_id` from the handoff's `incidents` array and use the same cutoff to look up that historical result. For example, the demo's AWS incident is open at `12:21:00Z` and becomes resolved when the recovery is received at `12:22:00Z`.
+
+```sh
+python3 -B sre_mvp.py --db "$demo_dir/signals.sqlite3" get-incident \
+  --as-of 2026-01-15T12:21:00Z \
+  --incident-id 'health:synthetic-aws-01/synthetic-aws-prod/synthetic-aws-outage-0001'
+```
+
+The single JSON object has `kind: "synthetic_sre_incident_detail"`, `version: 1`, `as_of`, the requested `incident_id`, and a `status` of `found` or `not_found`. When found, `incident` is the matching handoff item, including its own `open` or `resolved` status and evidence. A well-formed ID without an exact match returns `not_found` and `incident: null` with exit status 0. This means only that the ID is absent from that historical snapshot, not that the service is healthy.
+
+No cost policy is needed. The command validates the whole read-only database snapshot, including rows received after the cutoff, and correlates only evidence received at or before `as_of`. It returns no unrelated incidents, unapplied evidence, or cost results. Invalid timestamps, IDs, or database contents fail without a JSON response, as do missing required options or a missing database. This is a local synthetic lookup, not a live OpenClaw operation.
+
 ### Local synthetic investigation report
 
 Using the demo store above, save the unmodified handoff bytes and check a bundled mock response for one caller-selected incident:
