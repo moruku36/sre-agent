@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "source": "synthetic-aws-01",
+      "provider": "aws",
+      "scope": "synthetic-aws-prod",
+      "environment": "synthetic-prod",
+      "service": "synthetic-api",
+      "target": "synthetic-cluster-a",
+      "kind": "cost_actual",
+      "unit": "USD",
+      "threshold": 150,
+      "max_age_seconds": 3900
+    },
+    {
+      "source": "synthetic-azure-01",
+      "provider": "azure",
+      "scope": "synthetic-azure-staging",
+      "environment": "synthetic-staging",
+      "service": "synthetic-web",
+      "target": "synthetic-region-east",
+      "kind": "cost_forecast",
+      "unit": "JPY",
+      "threshold": 100,
+      "max_age_seconds": 3900
+    },
+    {
+      "source": "synthetic-gcp-01",
+      "provider": "gcp",
+      "scope": "synthetic-gcp-dev",
+      "environment": "synthetic-dev",
+      "service": "synthetic-data",
+      "target": "synthetic-bucket-1",
+      "kind": "cost_estimate",
+      "unit": "USD",
+      "threshold": 150,
+      "max_age_seconds": 3900
+    },
+    {
+      "source": "synthetic-oci-01",
+      "provider": "oci",
+      "scope": "synthetic-oci-prod",
+      "environment": "synthetic-prod",
+      "service": "synthetic-cache",
+      "target": "synthetic-vm-1",
+      "kind": "cost_forecast",
+      "unit": "JPY",
+      "threshold": 150,
+      "max_age_seconds": 3900
+    },
+    {
+      "source": "synthetic-sakura-01",
+      "provider": "sakura",
+      "scope": "synthetic-sakura-prod",
+      "environment": "synthetic-prod",
+      "service": "synthetic-queue",
+      "target": "synthetic-zone-1",
+      "kind": "cost_forecast",
+      "unit": "JPY",
+      "threshold": 150,
+      "max_age_seconds": 3900
+    }
+  ]
+}
