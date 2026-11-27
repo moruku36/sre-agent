@@ -1,0 +1,13 @@
+{
+  "schema": "sre-monitoring-intake/v1",
+  "provenance": "synthetic",
+  "scope": {
+    "resource_container": "projects/orchard-demo-invalid",
+    "model_user_id": "orchard-counter-v1",
+    "interval": {
+      "startTime": "2031-04-02T00:00:00Z",
+      "endTime": "2031-04-02T00:00:10Z"
+    }
+  },
+  "read_state": "denied"
+}
