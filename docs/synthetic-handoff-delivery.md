@@ -1,8 +1,8 @@
 # Local synthetic handoff delivery and ACK / ローカル合成ハンドオフと ACK
 
-This example models the pull/ACK part of [architecture §4](architecture.md#4-openclawを運用ハーネスにする) for one local consumer. It wraps the [existing v1 synthetic handoff](../README.md#local-synthetic-handoff-for-openclaw) without changing how the health and cost snapshot is built. Nothing is sent to OpenClaw or another service.
+This example models the pull/ACK part of [architecture §4](architecture.md#4-openclawを運用ハーネスにする) for one local consumer. It wraps the [existing v1 synthetic handoff](synthetic-signals.md#local-synthetic-handoff-for-openclaw) without changing how the health and cost snapshot is built. Nothing is sent to OpenClaw or another service.
 
-[設計 §4](architecture.md#4-openclawを運用ハーネスにする) の取得と ACK だけを、合成データと単一のローカル受信者で試せます。[既存の v1 ハンドオフ](../README.ja.md#openclaw向けのローカル模擬ハンドオフ) と同じ障害・料金スナップショットを使い、OpenClaw などには送信しません。
+[設計 §4](architecture.md#4-openclawを運用ハーネスにする) の取得と ACK だけを、合成データと単一のローカル受信者で試せます。[既存の v1 ハンドオフ](synthetic-signals.ja.md#openclaw向けのローカル模擬ハンドオフ) と同じ障害・料金スナップショットを使い、OpenClaw などには送信しません。
 
 Run from `examples/synthetic_signals` / `examples/synthetic_signals` で実行:
 
